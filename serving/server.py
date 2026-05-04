@@ -24,6 +24,7 @@ class Instance(BaseModel):
   input: list[float] = Field(..., min_length=1)
   horizon: int = Field(..., gt=0)
   return_quantiles: bool = True
+  return_backcast: bool = False
 
 
 class PredictRequest(BaseModel):
@@ -33,6 +34,8 @@ class PredictRequest(BaseModel):
 class Prediction(BaseModel):
   point_forecast: list[float]
   quantile_forecast: list[list[float]] | None = None
+  backcast: list[float] | None = None
+  backcast_quantiles: list[list[float]] | None = None
 
 
 class PredictResponse(BaseModel):
@@ -56,9 +59,12 @@ async def lifespan(app: FastAPI):
       force_flip_invariance=True,
       infer_is_positive=True,
       fix_quantile_crossing=True,
+      return_backcast=True,
     )
   )
   _state["model"] = model
+  # Backcast covers timesteps [p, max_context); first patch can't be predicted from prefix.
+  _state["backcast_len"] = MAX_CONTEXT - model.model.p
   yield
   _state.clear()
 
@@ -87,14 +93,33 @@ def predict(req: PredictRequest):
   inputs = [np.array(inst.input, dtype=np.float32) for inst in req.instances]
   point, quantiles = _state["model"].forecast(horizon=batch_horizon, inputs=inputs)
 
-  return PredictResponse(
-    predictions=[
+  # With return_backcast=True, point/quantiles have shape (batch, B + batch_horizon, ...)
+  # where B = backcast_len. Forecast portion is the last batch_horizon entries;
+  # backcast portion is the preceding B entries (last input_len of those are meaningful).
+  B = _state["backcast_len"]
+
+  predictions = []
+  for i, inst in enumerate(req.instances):
+    fc_point = point[i, B : B + inst.horizon].tolist()
+    fc_quant = (
+      quantiles[i, B : B + inst.horizon].tolist() if inst.return_quantiles else None
+    )
+
+    bc_point = None
+    bc_quant = None
+    if inst.return_backcast:
+      bc_len = min(len(inst.input), B)
+      bc_point = point[i, B - bc_len : B].tolist()
+      if inst.return_quantiles:
+        bc_quant = quantiles[i, B - bc_len : B].tolist()
+
+    predictions.append(
       Prediction(
-        point_forecast=point[i, : inst.horizon].tolist(),
-        quantile_forecast=(
-          quantiles[i, : inst.horizon].tolist() if inst.return_quantiles else None
-        ),
+        point_forecast=fc_point,
+        quantile_forecast=fc_quant,
+        backcast=bc_point,
+        backcast_quantiles=bc_quant,
       )
-      for i, inst in enumerate(req.instances)
-    ]
-  )
+    )
+
+  return PredictResponse(predictions=predictions)

@@ -32,19 +32,38 @@ A minimal HTTP server wrapping `model.forecast()` so the model is reachable as a
 POST /predict
 {
   "instances": [
-    {"input": [float, ...], "horizon": int, "return_quantiles": bool}
+    {"input": [float, ...], "horizon": int,
+     "return_quantiles": bool,    // default true
+     "return_backcast": bool}      // default false
   ]
 }
 →
 {
   "predictions": [
     {"point_forecast": [float ...horizon],
-     "quantile_forecast": [[10 floats], ...horizon]}
+     "quantile_forecast": [[10 floats], ...horizon],
+     "backcast": [float ...input_len],            // only when return_backcast=true
+     "backcast_quantiles": [[10 floats], ...input_len]}
   ]
 }
 ```
 
-`quantile_forecast[t]` is `[mean, q10, q20, q30, q40, q50, q60, q70, q80, q90]`. `point_forecast` is the median.
+`quantile_forecast[t]` (and `backcast_quantiles[t]`) is `[mean, q10, q20, q30, q40, q50, q60, q70, q80, q90]`. `point_forecast` is the median.
+
+### Backcast = retrospective view of the input
+
+When `return_backcast=true`, the response includes the model's reconstruction of the input (its expected value at each input timestep, given the rest of the series). Use it for in-context anomaly detection:
+
+```python
+for t, actual in enumerate(input_values):
+    q10, q90 = backcast_quantiles[t][1], backcast_quantiles[t][9]
+    if actual < q10 or actual > q90:
+        # anomaly
+```
+
+**Caveat**: TimesFM works in patches of 32. For inputs shorter than `max_context`, the first **~32 backcast values** are predictions made from prefixes that include left-padding zeros — they are **not reliable**. For anomaly detection on short series, skip `backcast[:32]`. For full-length inputs (≥ max_context), all returned backcast values are reliable.
+
+The forecast portion of the response is unaffected by `return_backcast`. Setting it to true adds the backcast fields without changing `point_forecast` or `quantile_forecast`.
 
 ### Build / run / test
 
@@ -103,6 +122,7 @@ These are deliberately turned on:
 - `force_flip_invariance=True` — guarantees `f(-x) = -f(x)` by running on `+x` and `-x` and averaging. **Doubles inference work.** Drop this for ~2× speedup if you don't need the symmetry guarantee.
 - `infer_is_positive=True` — clamps forecast `≥ 0` if all inputs are `≥ 0`.
 - `fix_quantile_crossing=True` — ensures `q10 ≤ q20 ≤ ... ≤ q90`.
+- `return_backcast=True` — model emits its in-context reconstruction along with the forecast. Free (no extra deps) and required for retrospective anomaly detection. Per-request `return_backcast` field controls whether the backcast is *included in the JSON response*; this server-side flag controls whether it's *computed at all*.
 
 See `src/timesfm/configs.py` for the full ForecastConfig and `src/timesfm/timesfm_2p5/timesfm_2p5_torch.py:352-487` for what each flag actually does in the compiled decode path.
 
