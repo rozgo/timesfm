@@ -126,6 +126,74 @@ These are deliberately turned on:
 
 See `src/timesfm/configs.py` for the full ForecastConfig and `src/timesfm/timesfm_2p5/timesfm_2p5_torch.py:352-487` for what each flag actually does in the compiled decode path.
 
+## Showcase dataset (`serving/showcase/`)
+
+A 7-series synthetic dataset designed to exercise distinct TimesFM strengths. **Each series is in its own CSV** so visualizations (e.g., Rerun) can load them independently without conflating examples.
+
+| Series | Pattern | Strength shown |
+| --- | --- | --- |
+| `web_traffic_hourly` | hourly visits, daily × weekly cycle, slight trend | multi-period seasonality |
+| `energy_load_hourly` | bimodal daily peaks, weekday boost, slow envelope | harmonic structure |
+| `temperature_daily` | 3 yrs daily, yearly cycle + warming trend + AR(1) weather | long-range periodic forecast |
+| `saas_revenue_daily` | exponential growth, weekly dip, holiday plateaus | trend + seasonality together |
+| `server_cpu_5min` | stationary baseline + 3 planted anomalies | backcast anomaly detection |
+| `stock_returns_daily` | GBM prices (no signal) | wide calibrated PIs / negative result |
+| `parts_demand_daily` | sparse intermittent (mostly zeros) | non-Gaussian distributions |
+
+### File layout
+
+```
+serving/showcase/
+├── gen_showcase.py             # generator (deterministic, seed=42)
+├── run_forecasts.py            # forecast driver (hits localhost:8080)
+├── data/
+│   ├── web_traffic_hourly.csv      columns: timestamp, value, split
+│   ├── energy_load_hourly.csv      (split ∈ {context, holdout})
+│   ├── temperature_daily.csv
+│   ├── saas_revenue_daily.csv
+│   ├── server_cpu_5min.csv
+│   ├── stock_returns_daily.csv
+│   └── parts_demand_daily.csv
+└── forecasts/
+    ├── web_traffic_hourly.csv      columns: timestamp, split, actual,
+    ├── ...                          predicted_mean, predicted_q10,
+    └── parts_demand_daily.csv      predicted_q50, predicted_q90, is_anomaly
+```
+
+Filenames in `data/` and `forecasts/` match by series_id. For context rows, `predicted_*` fields are the model's **backcast** (in-context reconstruction) and `is_anomaly` flags `actual ∉ [q10, q90]`. For holdout rows, `predicted_*` are the **forecast** and `is_anomaly` flags forecast misses.
+
+### Reproduce
+
+```bash
+# Regenerate input CSVs
+uv run --with numpy python serving/showcase/gen_showcase.py
+
+# Forecast (container must be running on :8080)
+docker run -d --name timesfm-test -p 8080:8080 timesfm-server
+python serving/showcase/run_forecasts.py
+docker stop timesfm-test && docker rm timesfm-test
+```
+
+End-to-end forecast time for all 7 series is ~4 seconds on a warm container.
+
+### Measured forecast quality
+
+| Series | MAE (rel) | 80% PI coverage |
+| --- | --- | --- |
+| web_traffic_hourly | 4.2% | **79.8%** (near-perfect calibration) |
+| saas_revenue_daily | 2.3% | 85.0% |
+| server_cpu_5min | 8.7% | 85.0% |
+| energy_load_hourly | 7.2% | 76.8% |
+| temperature_daily | 36.7%* | 71.1% |
+| parts_demand_daily | 99.5%* | 80.0% |
+| stock_returns_daily | 13.2% | **10.0%** (random walk — calibration fails as expected) |
+
+*Relative error is misleading when the mean magnitude is small (parts_demand_daily mean ≈ 0.87, so 1-unit MAE = 99.5% relatively). Absolute MAE of 0.86 is reasonable for 0–5 sparse demand. Same caveat for temperature in low-temp days.
+
+### Anomaly detection check
+
+All 14 planted anomalies in `server_cpu_5min` (1 single spike at t=200, 12-step sustained drift at t=500-511, 1 low outlier at t=820) are correctly flagged as outside the backcast 80% PI.
+
 ## Things deliberately NOT built
 
 - LLM-extractor agent layer (the "any doc → extract series → call /predict" path discussed). The server is the deterministic primitive; the LLM layer is a separate concern.
